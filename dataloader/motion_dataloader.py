@@ -1,6 +1,8 @@
+from __future__ import print_function
 import numpy as np
 import pickle
 from PIL import Image
+from enum import Enum
 import time
 import shutil
 import random
@@ -15,175 +17,234 @@ import torch.backends.cudnn as cudnn
 from torch.autograd import Variable
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
-from split_train_test_video import *
- 
-class motion_dataset(Dataset):  
-    def __init__(self, dic, in_channel, root_dir, mode, transform=None):
-        #Generate a 16 Frame clip
-        self.keys=dic.keys()
-        self.values=dic.values()
+from .split_train_test_video import *
+
+FILE = os.path.dirname(os.path.realpath(__file__))
+
+
+class DataSetType(Enum):
+    UCF101 = 1
+    HMDB51 = 2
+
+
+class MotionDataset(Dataset):
+    """
+    Generic class for generating stacked optical flow images from a splitter.
+    """
+
+    def __init__(self,
+                 dic,
+                 in_channel,
+                 root_dir,
+                 mode,
+                 transform=None,
+                 zero_indexed=False,
+                 prefix="v_"):
+        # Generate a 16 Frame clip
+        self.keys = list(dic.keys())
+        self.values = list(dic.values())
         self.root_dir = root_dir
         self.transform = transform
-        self.mode=mode
+        self.prefix = prefix
+        self.mode = mode
+        self.zero_indexed = zero_indexed
         self.in_channel = in_channel
-        self.img_rows=224
-        self.img_cols=224
+        self.img_rows = 224
+        self.img_cols = 224
 
     def stackopf(self):
-        name = 'v_'+self.video
-        u = self.root_dir+ 'u/' + name
-        v = self.root_dir+ 'v/'+ name
-        
-        flow = torch.FloatTensor(2*self.in_channel,self.img_rows,self.img_cols)
-        i = int(self.clips_idx)
+        name = self.prefix + self.video
+        u = self.root_dir + 'u/' + name
+        v = self.root_dir + 'v/' + name
 
+        flow = torch.FloatTensor(2 * self.in_channel, self.img_rows,
+                                 self.img_cols)
+        i = int(self.clips_idx)
 
         for j in range(self.in_channel):
             idx = i + j
             idx = str(idx)
-            frame_idx = 'frame'+ idx.zfill(6)
-            h_image = u +'/' + frame_idx +'.jpg'
-            v_image = v +'/' + frame_idx +'.jpg'
-            
-            imgH=(Image.open(h_image))
-            imgV=(Image.open(v_image))
+            frame_idx = 'frame' + idx.zfill(6)
+            h_image = u + '/' + frame_idx + '.jpg'
+            v_image = v + '/' + frame_idx + '.jpg'
+
+            imgH = (Image.open(h_image))
+            imgV = (Image.open(v_image))
 
             H = self.transform(imgH)
             V = self.transform(imgV)
 
-            
-            flow[2*(j-1),:,:] = H
-            flow[2*(j-1)+1,:,:] = V      
+            flow[2 * (j - 1), :, :] = H
+            flow[2 * (j - 1) + 1, :, :] = V
             imgH.close()
-            imgV.close()  
+            imgV.close()
         return flow
 
     def __len__(self):
         return len(self.keys)
 
     def __getitem__(self, idx):
-        #print ('mode:',self.mode,'calling Dataset:__getitem__ @ idx=%d'%idx)
-        
         if self.mode == 'train':
-            self.video, nb_clips = self.keys[idx].split('-')
-            self.clips_idx = random.randint(1,int(nb_clips))
+            self.video, nb_clips = self.keys[idx].split('|')
+            self.clips_idx = random.randint(1, int(nb_clips))
         elif self.mode == 'val':
-            self.video,self.clips_idx = self.keys[idx].split('-')
+            self.video, self.clips_idx = self.keys[idx].split('|')
         else:
             raise ValueError('There are only train and val mode')
 
         label = self.values[idx]
-        label = int(label)-1 
+        if not self.zero_indexed:
+            label = int(label) - 1
         data = self.stackopf()
 
         if self.mode == 'train':
-            sample = (data,label)
+            sample = (data, label)
         elif self.mode == 'val':
-            sample = (self.video,data,label)
+            sample = (self.video, data, label)
         else:
             raise ValueError('There are only train and val mode')
         return sample
 
 
-
-
-
 class Motion_DataLoader():
-    def __init__(self, BATCH_SIZE, num_workers, in_channel,  path, ucf_list, ucf_split):
-
-        self.BATCH_SIZE=BATCH_SIZE
+    def __init__(self,
+                 BATCH_SIZE,
+                 num_workers,
+                 in_channel,
+                 path,
+                 list_path,
+                 split,
+                 dataset_type=DataSetType.UCF101):
+        self.BATCH_SIZE = BATCH_SIZE
         self.num_workers = num_workers
-        self.frame_count={}
+        self.frame_count = {}
         self.in_channel = in_channel
-        self.data_path=path
+        self.data_path = path
+        self.dataset_type = dataset_type
         # split the training and testing videos
-        splitter = UCF101_splitter(path=ucf_list,split=ucf_split)
+        if dataset_type == DataSetType.UCF101:
+            splitter = UCF101_splitter(path=list_path, split=split)
+            self.prefix = "v_"
+            self.zero_indexed = False
+        elif dataset_type == DataSetType.HMDB51:
+            splitter = HmdbSplitter(split_path=list_path, split=int(split))
+            self.prefix = ""
+            self.zero_indexed = True
+        else:
+            raise ValueError("Only UCF101 and HMDB51 are supported")
         self.train_video, self.test_video = splitter.split_video()
-        
-    def load_frame_count(self):
-        #print '==> Loading frame number of each video'
-        with open('dic/frame_count.pickle','rb') as file:
-            dic_frame = pickle.load(file)
-        file.close()
 
-        for line in dic_frame :
-            videoname = line.split('_',1)[1].split('.',1)[0]
-            n,g = videoname.split('_',1)
-            if n == 'HandStandPushups':
-                videoname = 'HandstandPushups_'+ g
-            self.frame_count[videoname]=dic_frame[line] 
+    def load_frame_count(self):
+        if self.dataset_type == DataSetType.UCF101:
+            with open(os.path.join(FILE, 'dic/frame_count.pickle'),
+                      'rb') as file:
+                dic_frame = pickle.load(file)
+
+            for line in dic_frame:
+                videoname = line.split('_', 1)[1].split('.', 1)[0]
+                n, g = videoname.split('_', 1)
+                if n == 'HandStandPushups':
+                    videoname = 'HandstandPushups_' + g
+                self.frame_count[videoname] = dic_frame[line]
+        elif self.dataset_type == DataSetType.HMDB51:
+            # Don't need to remove any v_ or .avi
+            with open(os.path.join(FILE, 'dic/hmdb_frame_count.pickle'),
+                      'rb') as file:
+                dic_frame = pickle.load(file)
+            for line in dic_frame:
+                self.frame_count[line] = dic_frame[line]
+        else:
+            raise ValueError("Only UCF101 and HMDB51 are supported")
 
     def run(self):
         self.load_frame_count()
         self.get_training_dic()
-        self.val_sample19()
+        self.val_sample()
         train_loader = self.train()
         val_loader = self.val()
 
         return train_loader, val_loader, self.test_video
-            
-    def val_sample19(self):
-        self.dic_test_idx = {}
-        #print len(self.test_video)
-        for video in self.test_video:
-            n,g = video.split('_',1)
 
-            sampling_interval = int((self.frame_count[video]-10+1)/19)
-            for index in range(19):
-                clip_idx = index*sampling_interval
-                key = video + '-' + str(clip_idx+1)
+    def val_sample(self):
+        if self.dataset_type == DataSetType.UCF101:
+            rate = 19  # minimum frame count of 28
+        elif self.dataset_type == DataSetType.HMDB51:
+            rate = 8  # minimum frame count of 17
+        else:
+            raise ValueError("Only UCF101 and HMDB51 are supported")
+
+        self.dic_test_idx = {}
+        for video in self.test_video:
+            n, g = video.split('_', 1)
+
+            sampling_interval = int((self.frame_count[video] - 10 + 1) / rate)
+            for index in range(rate):
+                clip_idx = index * sampling_interval
+                key = video + '|' + str(clip_idx + 1)
                 self.dic_test_idx[key] = self.test_video[video]
-             
+
     def get_training_dic(self):
-        self.dic_video_train={}
+        self.dic_video_train = {}
         for video in self.train_video:
-            
-            nb_clips = self.frame_count[video]-10+1
-            key = video +'-' + str(nb_clips)
-            self.dic_video_train[key] = self.train_video[video] 
-                            
+            nb_clips = self.frame_count[video] - 10 + 1
+            key = video + '|' + str(nb_clips)
+            self.dic_video_train[key] = self.train_video[video]
+
     def train(self):
-        training_set = motion_dataset(dic=self.dic_video_train, in_channel=self.in_channel, root_dir=self.data_path,
+        training_set = MotionDataset(
+            dic=self.dic_video_train,
+            in_channel=self.in_channel,
+            root_dir=self.data_path,
             mode='train',
-            transform = transforms.Compose([
-            transforms.Scale([224,224]),
-            transforms.ToTensor(),
+            prefix=self.prefix,
+            zero_indexed=self.zero_indexed,
+            transform=transforms.Compose([
+                transforms.Resize([224, 224]),
+                transforms.ToTensor(),
             ]))
-        print '==> Training data :',len(training_set),' videos',training_set[1][0].size()
+        print('==> Training data :', len(training_set), ' videos',
+              training_set[1][0].size())
 
         train_loader = DataLoader(
-            dataset=training_set, 
+            dataset=training_set,
             batch_size=self.BATCH_SIZE,
             shuffle=True,
             num_workers=self.num_workers,
-            pin_memory=True
-            )
+            pin_memory=True)
 
         return train_loader
 
     def val(self):
-        validation_set = motion_dataset(dic= self.dic_test_idx, in_channel=self.in_channel, root_dir=self.data_path ,
-            mode ='val',
-            transform = transforms.Compose([
-            transforms.Scale([224,224]),
-            transforms.ToTensor(),
+        validation_set = MotionDataset(
+            dic=self.dic_test_idx,
+            in_channel=self.in_channel,
+            root_dir=self.data_path,
+            mode='val',
+            prefix=self.prefix,
+            zero_indexed=self.zero_indexed,
+            transform=transforms.Compose([
+                transforms.Resize([224, 224]),
+                transforms.ToTensor(),
             ]))
-        print '==> Validation data :',len(validation_set),' frames',validation_set[1][1].size()
-        #print validation_set[1]
+        print('==> Validation data :', len(validation_set), ' frames',
+              validation_set[1][1].size())
 
         val_loader = DataLoader(
-            dataset=validation_set, 
-            batch_size=self.BATCH_SIZE, 
+            dataset=validation_set,
+            batch_size=self.BATCH_SIZE,
             shuffle=False,
             num_workers=self.num_workers)
 
         return val_loader
 
+
 if __name__ == '__main__':
-    data_loader =Motion_DataLoader(BATCH_SIZE=1,num_workers=1,in_channel=10,
-                                        path='/home/ubuntu/data/UCF101/tvl1_flow/',
-                                        ucf_list='/home/ubuntu/cvlab/pytorch/ucf101_two_stream/github/UCF_list/',
-                                        ucf_split='01'
-                                        )
-    train_loader,val_loader,test_video = data_loader.run()
-    #print train_loader,val_loader
+    data_loader = Motion_DataLoader(
+        BATCH_SIZE=1,
+        num_workers=1,
+        in_channel=10,
+        path='/vision/vision_users/azou/data/hmdb51_flow/',
+        list_path='/vision/vision_users/azou/data/hmdb51-splits/',
+        split='01',
+        dataset_type=DataSetType.HMDB51)
+    train_loader, val_loader, test_video = data_loader.run()

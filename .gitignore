@@ -1,0 +1,9 @@
+.*
+__pycache__/
+jobs/
+!/.gitignore
+record
+saved
+**/*.pyc
+*.pickle
+*.pth
